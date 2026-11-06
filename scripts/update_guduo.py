@@ -10,17 +10,30 @@ TMDB_API_KEY = os.environ.get('TMDB_API_KEY')
 DATA_DIR = "data"
 OUTPUT_FILE = os.path.join(DATA_DIR, "guduo-hot.json")
 
-# 自动计算北京时间“昨天”的日期 (骨朵最新数据只有前一天的)
+# 北京时间
 tz_bj = datetime.timezone(datetime.timedelta(hours=8))
 yesterday = (datetime.datetime.now(tz_bj) - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-# 动态构建骨朵 API 字典
-GUDUO_API_URLS = {
-    "动漫": f"https://d2.guduomedia.com/m/v3/billboard/list?type=DAILY&category=ALL_ANIME&date={yesterday}&attach=gdi&orderTitle=gdi&platformId=0",
-    "剧集": f"https://d2.guduomedia.com/m/v3/billboard/list?type=DAILY&category=NETWORK_DRAMA&date={yesterday}&attach=gdi&orderTitle=gdi&platformId=0",
-    "综艺": f"https://d2.guduomedia.com/m/v3/billboard/list?type=DAILY&category=NETWORK_VARIETY&date={yesterday}&attach=gdi&orderTitle=gdi&platformId=0",
-    "电影": f"https://d2.guduomedia.com/m/v3/billboard/list?type=DAILY&category=NETWORK_MOVIE&date={yesterday}&attach=gdi&orderTitle=gdi&platformId=0"
+# 骨朵日榜可能晚一两天才出（2026-11 实测：11-05 的榜 11-06 仍查不到），
+# 所以按天往回找最近一个真有数据的日期，找到就全局固定用它，保证四个分类同榜同日。
+GUDUO_CATEGORIES = {
+    "剧集": "NETWORK_DRAMA",
+    "综艺": "NETWORK_VARIETY",
+    "动漫": "ALL_ANIME",
+    "电影": "NETWORK_MOVIE",
 }
+
+def billboard_url(category: str, date: str) -> str:
+    return (f"https://d2.guduomedia.com/m/v3/billboard/list?type=DAILY"
+            f"&category={GUDUO_CATEGORIES[category]}&date={date}"
+            f"&attach=gdi&orderTitle=gdi&platformId=0")
+
+def candidate_dates(days=7):
+    """昨天往前共 days 天，供逐日探测。"""
+    return [
+        (datetime.datetime.now(tz_bj) - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        for i in range(1, days + 1)
+    ]
 
 # 伪装头
 HEADERS = {
@@ -88,7 +101,7 @@ def clean_title(title):
 # --- 3. 骨朵数据抓取模块 ---
 async def fetch_guduo_category(session, category_name, url):
     """获取指定分类的骨朵榜单"""
-    print(f"正在抓取骨朵 [{category_name}] 榜单 (日期: {yesterday})...")
+    print(f"正在抓取骨朵 [{category_name}] 榜单...")
     items_list = []
     
     try:
@@ -224,7 +237,26 @@ async def batch_process_tmdb(session, items_list, size, cache):
         await asyncio.sleep(0.3)
     return results
 
-# --- 6. 主程序 ---
+# --- 6. 日期解析：从昨天往回找最近一个真有数据的日期 ---
+async def resolve_date(session):
+    probe_cat = "剧集"
+    for d in candidate_dates():
+        url = billboard_url(probe_cat, d)
+        try:
+            async with session.get(url, headers=HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("data"):
+                        print(f"📅 骨朵最近有数据的日期: {d}")
+                        return d
+                    print(f"🔍 {d} 无数据，继续往前找...")
+        except Exception as e:
+            print(f"⚠️ 探测 {d} 出错: {e}")
+        await asyncio.sleep(0.5)
+    print("⚠️ 往回 7 天全部无数据，回退到昨天")
+    return yesterday
+
+# --- 7. 主程序 ---
 async def main():
     if not TMDB_API_KEY:
         print("❌ 错误: 未检测到 TMDB_API_KEY 环境变量！")
@@ -234,8 +266,10 @@ async def main():
     all_guduo_items = []
 
     async with aiohttp.ClientSession() as session:
-        print(f"🚀 开始并发请求骨朵数据中心...")
-        for cat, url in GUDUO_API_URLS.items():
+        print("🚀 开始并发请求骨朵数据中心...")
+        date_used = await resolve_date(session)
+        for cat in GUDUO_CATEGORIES:
+            url = billboard_url(cat, date_used)
             items = await with_retry(lambda c=cat, u=url: fetch_guduo_category(session, c, u), cat)
             all_guduo_items.extend(items or [])
             
@@ -247,7 +281,7 @@ async def main():
         # 按分类重组数据
         final_result = {
             "source": "Guduo Media",
-            "billboard_date": yesterday,
+            "billboard_date": date_used,
             "last_updated": datetime.datetime.now(tz_bj).strftime("%Y-%m-%d %H:%M:%S"),
             "categories": {
                 "剧集": [{k: v for k, v in x.items() if k != "_category"} for x in matched_items if x['_category'] == '剧集'],
